@@ -1,0 +1,12 @@
+{
+	"id": "io.github.DeadIndian.GpuRun",
+	"name": "gpu-run",
+	"summary": "GPU execution queue and scheduler",
+	"description": "gpu-run queues GPU-heavy commands and runs them in a background daemon to improve GPU utilization. It supports various AI tools like Ollama, llama.cpp, ComfyUI, and Automatic1111.",
+	"developer_name": "DeadIndian",
+	"project_license": "MIT",
+	"homepage": "https://github.com/DeadIndian/Gpu-run",
+	"categories": ["Utility"],
+	"screenshots": [],
+	"releases": []
+}
