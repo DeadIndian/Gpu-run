@@ -1,0 +1,21 @@
+PackageIdentifier: GitHub.GpuRun
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: Your Name
+PackageName: gpu-run
+ShortDescription: Intelligent GPU execution wrapper for GPU-heavy local AI workloads.
+License: MIT
+LicenseUrl: https://opensource.org/licenses/MIT
+Tags:
+  - gpu
+  - ai
+  - cli
+Moniker:
+  - gpu-run
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    InstallerUrl: https://github.com/<username>/Gpu-run/releases/download/v0.1.0/gpu-run-windows-x64.zip
+    InstallerSha256: PLACEHOLDER_SHA256
+    Scope: machine
+    InstallerLocale: en-US

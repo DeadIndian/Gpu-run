@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=gpu-run
+Comment=GPU execution queue and scheduler
+Exec=gpu-run
+Icon=io.github.DeadIndian.GpuRun
+Terminal=true
+Categories=Utility;

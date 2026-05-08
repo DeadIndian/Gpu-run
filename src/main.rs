@@ -2,6 +2,7 @@ mod cli;
 mod daemon;
 mod execution;
 mod fingerprint;
+mod queue;
 mod scheduler;
 mod telemetry;
 

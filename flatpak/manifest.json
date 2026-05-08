@@ -1,0 +1,33 @@
+{
+	"app-id": "io.github.DeadIndian.GpuRun",
+	"runtime": "org.freedesktop.Platform",
+	"runtime-version": "24.08",
+	"sdk": "org.freedesktop.Sdk",
+	"sdk-extensions": ["org.freedesktop.Sdk.Extension.rust-stable"],
+	"command": "gpu-run",
+	"finish-args": ["--filesystem=home", "--share=network"],
+	"modules": [
+		{
+			"name": "gpu-run",
+			"buildsystem": "simple",
+			"build-options": {
+				"env": {
+					"PATH": "/usr/lib/sdk/rust-stable/bin:$PATH"
+				}
+			},
+			"build-commands": [
+				"cargo build --release --locked",
+				"install -Dm755 target/release/gpu-run /app/bin/gpu-run",
+				"install -Dm644 flatpak/gpu-run.desktop /app/share/applications/gpu-run.desktop",
+				"install -Dm644 flatpak/icons/256x256/apps/io.github.DeadIndian.GpuRun.svg /app/share/icons/hicolor/256x256/apps/io.github.DeadIndian.GpuRun.svg"
+			],
+			"sources": [
+				{
+					"type": "git",
+					"url": "https://github.com/DeadIndian/Gpu-run.git",
+					"branch": "main"
+				}
+			]
+		}
+	]
+}
