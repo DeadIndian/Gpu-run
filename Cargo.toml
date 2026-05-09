@@ -20,3 +20,16 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 thiserror = "1.0"
 reqwest = { version = "0.11", features = ["json"] }
 toml = "0.8"
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38", "auto-initialize"], optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3"]
+
+[lib]
+name = "gpu_run"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "gpu-run"
+path = "src/main.rs"
