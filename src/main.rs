@@ -1,10 +1,13 @@
+mod batching;
 mod cli;
 mod daemon;
 mod execution;
+mod executors;
 mod fingerprint;
 mod queue;
 mod scheduler;
 mod telemetry;
+mod vram_safety;
 
 use anyhow::Result;
 use clap::Parser;

@@ -4,11 +4,15 @@ use std::io::{Read, Write};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info};
 
-use crate::execution;
+use crate::batching::BatchAssembler;
+use crate::executors::get_executor_for_backend;
 use crate::queue;
 use crate::scheduler;
 use crate::telemetry;
+use crate::vram_safety::{VramSafetyConfig, VramSafetyLayer};
+use crate::telemetry::GpuTelemetrySnapshot;
 
 pub async fn show_queue() -> Result<()> {
     let state = queue::load_queue()?;
@@ -162,36 +166,194 @@ pub async fn daemon_run_loop() -> Result<()> {
     write_pid(pid)?;
     println!("GPU-run daemon is running with pid {}", pid);
 
+    // Initialize components
+    let mut batch_assembler = BatchAssembler::new(2000);
+    let vram_config = VramSafetyConfig::default();
+    let mut vram_safety = VramSafetyLayer::new(vram_config);
+    
     loop {
         let mut state = queue::load_queue()?;
-        if let Some(index) = scheduler::pick_next_job(&state) {
-            state.jobs[index].status = queue::JobStatus::Running;
-            state.jobs[index].started_at = Some(current_time_micros());
-            queue::save_queue(&state)?;
-            let job = state.jobs[index].clone();
-
-            let result = execution::execute_job(&job).await;
-            state.jobs[index].finished_at = Some(current_time_micros());
-            match result {
-                Ok(code) => {
-                    state.jobs[index].exit_code = Some(code);
-                    state.jobs[index].status = if code == 0 {
-                        queue::JobStatus::Completed
-                    } else {
-                        queue::JobStatus::Failed
-                    };
-                }
-                Err(err) => {
-                    state.jobs[index].exit_code = Some(-1);
-                    state.jobs[index].status = queue::JobStatus::Failed;
-                    state.jobs[index].error_message = Some(err.to_string());
+        let gpu_snapshot: GpuTelemetrySnapshot = telemetry::current_snapshot();
+        
+        // Add new pending jobs to batch assembler
+        let pending_jobs: Vec<_> = state.jobs
+            .iter()
+            .filter(|job| job.status == queue::JobStatus::Pending)
+            .cloned()
+            .collect();
+            
+        for job in pending_jobs {
+            let immediate_jobs = batch_assembler.add_job(job);
+            
+            // Execute jobs that shouldn't be batched immediately
+            for job in immediate_jobs {
+                if can_execute_job_vram_safe(&mut vram_safety, &job, &gpu_snapshot).await {
+                    execute_single_job(&mut state, &job).await?;
                 }
             }
-            queue::save_queue(&state)?;
-            continue;
+        }
+        
+        // Check for ready batches
+        let ready_batches = batch_assembler.get_ready_batches();
+        
+        for batch in ready_batches {
+            if batch.len() == 1 {
+                // Single job - execute normally
+                if can_execute_job_vram_safe(&mut vram_safety, &batch[0], &gpu_snapshot).await {
+                    execute_single_job(&mut state, &batch[0]).await?;
+                }
+            } else {
+                // Multiple jobs - check VRAM and potentially split batch
+                match vram_safety.can_execute_batch(&batch, &gpu_snapshot) {
+                    Ok(crate::vram_safety::VramDecision::Proceed) => {
+                        execute_batch_jobs(&mut state, &batch).await?;
+                    }
+                    Ok(crate::vram_safety::VramDecision::Wait(reason)) => {
+                        debug!("Batch waiting due to VRAM constraints: {}", reason.message());
+                        // Split batch into smaller chunks
+                        let suggested_size = vram_safety.suggest_batch_size(&batch, &gpu_snapshot)?;
+                        if suggested_size > 0 && suggested_size < batch.len() {
+                            let smaller_batch: Vec<_> = batch.iter().take(suggested_size).cloned().collect();
+                            info!("Splitting batch into smaller chunk of {} jobs", smaller_batch.len());
+                            if can_execute_batch_vram_safe(&mut vram_safety, &smaller_batch, &gpu_snapshot).await {
+                                execute_batch_jobs(&mut state, &smaller_batch).await?;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("VRAM safety check failed: {}", e);
+                        // Proceed with caution for single jobs
+                        if batch.len() == 1 {
+                            execute_single_job(&mut state, &batch[0]).await?;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Also check for individual jobs that should run immediately (no-batch or high priority)
+        if let Some(index) = scheduler::pick_next_job(&state) {
+            let job = &state.jobs[index];
+            if job.no_batch || job.priority_rank >= 3 {
+                if can_execute_job_vram_safe(&mut vram_safety, job, &gpu_snapshot).await {
+                    let job_clone = job.clone();
+                    execute_single_job(&mut state, &job_clone).await?;
+                }
+            }
         }
 
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(100)).await; // Check more frequently for batching
+    }
+}
+
+async fn execute_single_job(state: &mut queue::QueueState, job: &queue::Job) -> Result<()> {
+    let job_index = state.jobs.iter()
+        .position(|j| j.id == job.id)
+        .ok_or_else(|| anyhow::anyhow!("Job {} not found in state", job.id))?;
+    
+    info!("Executing single job: {}", job.command_line());
+    
+    state.jobs[job_index].status = queue::JobStatus::Running;
+    state.jobs[job_index].started_at = Some(current_time_micros());
+    queue::save_queue(state)?;
+    
+    let executor = get_executor_for_backend(job.fingerprint.backend.clone());
+    let result = executor.execute_single(job).await;
+    
+    finalize_job_execution(state, job_index, result).await
+}
+
+async fn execute_batch_jobs(state: &mut queue::QueueState, jobs: &[queue::Job]) -> Result<()> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    
+    info!("Executing batch of {} jobs", jobs.len());
+    
+    // Mark all jobs as running
+    for job in jobs {
+        if let Some(index) = state.jobs.iter().position(|j| j.id == job.id) {
+            state.jobs[index].status = queue::JobStatus::Running;
+            state.jobs[index].started_at = Some(current_time_micros());
+        }
+    }
+    queue::save_queue(state)?;
+    
+    // Get executor for the first job's backend (all should be same backend)
+    let executor = get_executor_for_backend(jobs[0].fingerprint.backend.clone());
+    let result = executor.execute_batch(jobs.to_vec()).await;
+    
+    // Update all jobs with results
+    for (i, job) in jobs.iter().enumerate() {
+        if let Some(index) = state.jobs.iter().position(|j| j.id == job.id) {
+            let exit_code = result.as_ref().map(|codes| codes.get(i).copied().unwrap_or(-1)).unwrap_or(-1);
+            finalize_job_execution(state, index, Ok(exit_code)).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn finalize_job_execution(
+    state: &mut queue::QueueState,
+    job_index: usize,
+    result: Result<i32>,
+) -> Result<()> {
+    state.jobs[job_index].finished_at = Some(current_time_micros());
+    match result {
+        Ok(code) => {
+            state.jobs[job_index].exit_code = Some(code);
+            state.jobs[job_index].status = if code == 0 {
+                queue::JobStatus::Completed
+            } else {
+                queue::JobStatus::Failed
+            };
+            debug!("Job {} completed with exit code: {}", state.jobs[job_index].id, code);
+        }
+        Err(err) => {
+            state.jobs[job_index].exit_code = Some(-1);
+            state.jobs[job_index].status = queue::JobStatus::Failed;
+            state.jobs[job_index].error_message = Some(err.to_string());
+            error!("Job {} failed: {}", state.jobs[job_index].id, err);
+        }
+    }
+    queue::save_queue(state)?;
+    Ok(())
+}
+
+async fn can_execute_job_vram_safe(
+    vram_safety: &mut VramSafetyLayer,
+    job: &queue::Job,
+    gpu_snapshot: &GpuTelemetrySnapshot,
+) -> bool {
+    match vram_safety.can_execute_batch(&[job.clone()], gpu_snapshot) {
+        Ok(crate::vram_safety::VramDecision::Proceed) => true,
+        Ok(crate::vram_safety::VramDecision::Wait(reason)) => {
+            debug!("Job {} waiting due to VRAM: {}", job.id, reason.message());
+            false
+        }
+        Err(e) => {
+            error!("VRAM check failed for job {}: {}", job.id, e);
+            true // Proceed with caution if check fails
+        }
+    }
+}
+
+async fn can_execute_batch_vram_safe(
+    vram_safety: &mut VramSafetyLayer,
+    batch: &[queue::Job],
+    gpu_snapshot: &GpuTelemetrySnapshot,
+) -> bool {
+    match vram_safety.can_execute_batch(batch, gpu_snapshot) {
+        Ok(crate::vram_safety::VramDecision::Proceed) => true,
+        Ok(crate::vram_safety::VramDecision::Wait(reason)) => {
+            debug!("Batch waiting due to VRAM: {}", reason.message());
+            false
+        }
+        Err(e) => {
+            error!("VRAM check failed for batch: {}", e);
+            batch.len() == 1 // Only proceed if it's a single job
+        }
     }
 }
 
